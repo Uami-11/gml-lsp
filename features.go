@@ -12,14 +12,15 @@ import (
 
 // CompletionItemKind values.
 const (
-	ckMethod   = 2
-	ckFunction = 3
-	ckVariable = 6
-	ckClass    = 7
-	ckModule   = 9
-	ckKeyword  = 14
-	ckEnum     = 13
-	ckConstant = 21
+	ckMethod     = 2
+	ckFunction   = 3
+	ckVariable   = 6
+	ckClass      = 7
+	ckModule     = 9
+	ckEnum       = 13
+	ckKeyword    = 14
+	ckEnumMember = 20
+	ckConstant   = 21
 )
 
 type Builtin struct {
@@ -89,6 +90,21 @@ func loadSpec(path string) (int, error) {
 				}
 				cur = &Builtin{Name: name, Kind: kind, Doc: xmlAttr(t, "description")}
 				params = nil
+			case "enumeration":
+				// Built-in enums (e.g. AudioEffectType) complete after a dot
+				// too, the same way project enums do.
+				if name := xmlAttr(t, "name"); name != "" {
+					cur = &Builtin{Name: name, Kind: ckEnum, Params: []string{}}
+				}
+			case "member":
+				if cur != nil && cur.Kind == ckEnum {
+					if name := xmlAttr(t, "name"); name != "" {
+						index.enums[cur.Name] = append(index.enums[cur.Name], Sym{
+							Name: name, Container: cur.Name, Kind: kindEnumMember,
+							End: utf16Len(name),
+						})
+					}
+				}
 			case "parameter", "argument":
 				if cur != nil {
 					p := xmlAttr(t, "name")
@@ -306,12 +322,48 @@ func completionKind(s Sym) int {
 		return ckMethod
 	case kindEnum:
 		return ckEnum
+	case kindEnumMember:
+		return ckEnumMember
 	case kindClass:
 		return ckClass
 	case kindModule:
 		return ckModule
 	}
 	return ckConstant
+}
+
+// completeQualified returns completion items for the qualifier written before a
+// dot: the members of an enum, or the project's globals after "global.". Any
+// other qualifier is unknown (struct fields and instance variables are not
+// indexed), so nothing is returned. An empty prefix lists everything.
+func (ix *Index) completeQualified(qual, prefix string) []CompletionItem {
+	if members, ok := ix.enums[qual]; ok {
+		var items []CompletionItem
+		for _, m := range members {
+			if matchScore(m.Name, prefix) < 0 {
+				continue
+			}
+			items = append(items, CompletionItem{
+				Label: m.Name, Kind: ckEnumMember, Detail: "enum " + qual,
+			})
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
+		return items
+	}
+	if qual == "global" {
+		var items []CompletionItem
+		for _, g := range ix.globals {
+			if matchScore(g.Name, prefix) < 0 {
+				continue
+			}
+			items = append(items, CompletionItem{
+				Label: g.Name, Kind: ckConstant, Detail: "global",
+			})
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
+		return items
+	}
+	return nil
 }
 
 func (ix *Index) complete(prefix string, limit int) []CompletionItem {

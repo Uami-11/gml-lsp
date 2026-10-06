@@ -175,7 +175,7 @@ func handle(raw []byte, out io.Writer) bool {
 				"definitionProvider":      true,
 				"referencesProvider":      true,
 				"hoverProvider":           true,
-				"completionProvider":      map[string]any{},
+				"completionProvider":      map[string]any{"triggerCharacters": []string{"."}},
 				"signatureHelpProvider":   map[string]any{"triggerCharacters": []string{"(", ","}, "retriggerCharacters": []string{","}},
 				"workspaceSymbolProvider": true,
 			},
@@ -282,7 +282,23 @@ func handle(raw []byte, out io.Writer) bool {
 		json.Unmarshal(req.Params, &p)
 		path := uriToPath(p.TextDocument.URI)
 		res := []Location{}
-		if w := wordAt(textOf(path), p.Position.Line, p.Position.Character); w != "" {
+		w, qual := qualifiedWordAt(textOf(path), p.Position.Line, p.Position.Character)
+		if w != "" {
+			if qual != "" {
+				// enum member or global: jump to the member, not any symbol
+				if m := index.lookupMember(qual, w); m != nil {
+					res = append(res, m.location())
+					reply(res)
+					break
+				}
+				if qual == "global" {
+					if g, ok := index.globals[w]; ok {
+						res = append(res, g.location())
+						reply(res)
+						break
+					}
+				}
+			}
 			for _, s := range index.lookup(w) {
 				res = append(res, s.location())
 			}
@@ -313,8 +329,20 @@ func handle(raw []byte, out io.Writer) bool {
 		json.Unmarshal(req.Params, &p)
 		path := uriToPath(p.TextDocument.URI)
 		md := ""
-		if w := wordAt(textOf(path), p.Position.Line, p.Position.Character); w != "" {
-			md = index.hover(w)
+		w, qual := qualifiedWordAt(textOf(path), p.Position.Line, p.Position.Character)
+		if w != "" {
+			if qual != "" {
+				if m := index.lookupMember(qual, w); m != nil {
+					md = fmt.Sprintf("**%s.%s** — enum member", qual, w)
+				} else if qual == "global" {
+					if _, ok := index.globals[w]; ok {
+						md = fmt.Sprintf("**global.%s** — global variable", w)
+					}
+				}
+			}
+			if md == "" {
+				md = index.hover(w)
+			}
 		}
 		if md == "" {
 			reply(nil)
@@ -376,8 +404,16 @@ func handle(raw []byte, out io.Writer) bool {
 				s--
 			}
 			prefix := l[s:end]
-			// no flooding on empty prefix, numbers, or after '.' (struct fields unknown)
-			if prefix != "" && !(prefix[0] >= '0' && prefix[0] <= '9') && !(s > 0 && l[s-1] == '.') {
+			if s > 0 && l[s-1] == '.' {
+				// qualified: enum members or globals; an empty prefix is fine here
+				q := s - 1
+				for q > 0 && isIdent(l[q-1]) {
+					q--
+				}
+				list.IsIncomplete = false
+				list.Items = index.completeQualified(l[q:s-1], prefix)
+			} else if prefix != "" && !(prefix[0] >= '0' && prefix[0] <= '9') {
+				// no flooding on empty prefixes or numbers
 				list.Items = index.complete(prefix, 200)
 			}
 		}

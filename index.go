@@ -12,12 +12,13 @@ import (
 
 // LSP SymbolKind values we use.
 const (
-	kindModule   = 2
-	kindClass    = 5
-	kindMethod   = 6
-	kindEnum     = 10
-	kindFunction = 12
-	kindConstant = 14
+	kindModule     = 2
+	kindClass      = 5
+	kindMethod     = 6
+	kindEnum       = 10
+	kindFunction   = 12
+	kindConstant   = 14
+	kindEnumMember = 22
 )
 
 // Sym is a named thing with a location. Columns are UTF-16 code units (LSP).
@@ -35,12 +36,19 @@ type Sym struct {
 }
 
 type Index struct {
-	files  map[string][]Sym // .gml path -> symbols declared in it
-	assets map[string]Sym   // asset name -> asset
+	files   map[string][]Sym // .gml path -> symbols declared in it
+	assets  map[string]Sym   // asset name -> asset
+	enums   map[string][]Sym // enum name -> member symbols
+	globals map[string]Sym   // global.name -> symbol (first definition wins)
 }
 
 func newIndex() *Index {
-	return &Index{files: map[string][]Sym{}, assets: map[string]Sym{}}
+	return &Index{
+		files:   map[string][]Sym{},
+		assets:  map[string]Sym{},
+		enums:   map[string][]Sym{},
+		globals: map[string]Sym{},
+	}
 }
 
 var (
@@ -48,6 +56,8 @@ var (
 	reAssignFunc = regexp.MustCompile(`^\s*(?:static\s+)?([A-Za-z_]\w*)\s*=\s*function\s*\(`)
 	reMacro      = regexp.MustCompile(`^\s*#macro\s+([A-Za-z_]\w*)`)
 	reEnum       = regexp.MustCompile(`^\s*enum\s+([A-Za-z_]\w*)`)
+	reGlobalSet  = regexp.MustCompile(`\bglobal\.([A-Za-z_]\w*)\s*(?:[-+*/%|&^]?=)`)
+	reGlobalVar  = regexp.MustCompile(`\bglobalvar\s+((?:[A-Za-z_]\w*\s*,\s*)*[A-Za-z_]\w*)\s*;`)
 )
 
 var declRes = []struct {
@@ -255,14 +265,195 @@ func (ix *Index) indexAssets(root string) {
 func (ix *Index) indexFile(path string) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		delete(ix.files, path)
+		ix.dropFile(path)
 		return
 	}
-	ix.files[path] = parseSymbols(path, string(b))
+	ix.indexText(path, string(b))
 }
 
 func (ix *Index) indexText(path, text string) {
+	ix.clearSymbols(path)
 	ix.files[path] = parseSymbols(path, text)
+	ix.enumsFrom(path, text)
+	ix.globalsFrom(path, text)
+}
+
+// clearSymbols removes enums and globals whose owning file is path, so
+// re-indexing a file never leaves stale members behind.
+func (ix *Index) clearSymbols(path string) {
+	for name, members := range ix.enums {
+		var keep []Sym
+		for _, m := range members {
+			if m.Path != path {
+				keep = append(keep, m)
+			}
+		}
+		if len(keep) == 0 {
+			delete(ix.enums, name)
+		} else {
+			ix.enums[name] = keep
+		}
+	}
+	for name, g := range ix.globals {
+		if g.Path == path {
+			delete(ix.globals, name)
+		}
+	}
+}
+
+// offsetToPos converts a byte offset within s into a 0-based line and a
+// UTF-16 column.
+func offsetToPos(s string, off int) (int, int) {
+	line := 0
+	idx := 0
+	for i := 0; i < len(s) && i < off; i++ {
+		if s[i] == '\n' {
+			line++
+			idx = i + 1
+		}
+	}
+	return line, utf16Len(s[idx:off])
+}
+
+// leadingIdent returns the first identifier in piece and its byte offset.
+func leadingIdent(piece string) (string, int) {
+	i := 0
+	for i < len(piece) && (piece[i] == ' ' || piece[i] == '\t' || piece[i] == '\n' || piece[i] == '\r') {
+		i++
+	}
+	s := i
+	for i < len(piece) && isIdent(piece[i]) {
+		i++
+	}
+	if s == i {
+		return "", 0
+	}
+	return piece[s:i], s
+}
+
+// span is a half-open range within a string.
+type span struct{ start, end int }
+
+// topLevelSpans returns the spans of s split on sep, ignoring separators
+// nested inside (), [] or {}, with offsets into the original s.
+func topLevelSpans(s string, sep byte) []span {
+	var out []span
+	d := 0
+	last := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[', '{':
+			d++
+		case ')', ']', '}':
+			d--
+		case sep:
+			if d == 0 {
+				out = append(out, span{last, i})
+				last = i + 1
+			}
+		}
+	}
+	return append(out, span{last, len(s)})
+}
+
+// enumsFrom stores the members of every enum declared in text (which may span
+// many lines) on ix.enums, with each member's real location.
+func (ix *Index) enumsFrom(path, text string) {
+	clean := stripNonCode(text)
+	clines := strings.Split(clean, "\n")
+	lineStart := 0
+	for i, cline := range clines {
+		clineStr := strings.TrimSuffix(cline, "\r")
+		m := reEnum.FindStringSubmatchIndex(clineStr)
+		if m == nil {
+			lineStart += len(clines[i]) + 1
+			continue
+		}
+		// find the '{' that starts the body, within a small window after the name
+		open := -1
+		limit := lineStart + m[3] + 200
+		if limit > len(clean) {
+			limit = len(clean)
+		}
+		for k := lineStart + m[3]; k < limit; k++ {
+			if clean[k] == '{' {
+				open = k
+				break
+			}
+		}
+		if open < 0 {
+			lineStart += len(clines[i]) + 1
+			continue
+		}
+		if bodyStart, body, ok := enumBody(clean, open); ok {
+			for _, sp := range topLevelSpans(body, ',') {
+				member, off := leadingIdent(body[sp.start:sp.end])
+				if member == "" {
+					continue
+				}
+				l, c := offsetToPos(clean, bodyStart+sp.start+off)
+				ix.enums[clineStr[m[2]:m[3]]] = append(ix.enums[clineStr[m[2]:m[3]]], Sym{
+					Name: member, Container: clineStr[m[2]:m[3]], Path: path,
+					Kind: kindEnumMember, Line: l, Start: c, End: c + utf16Len(member),
+				})
+			}
+		}
+		lineStart += len(clines[i]) + 1
+	}
+}
+
+// enumBody returns the body inside the braces starting at open, with its byte
+// offset in clean.
+func enumBody(clean string, open int) (int, string, bool) {
+	d := 0
+	for i := open; i < len(clean); i++ {
+		switch clean[i] {
+		case '{':
+			d++
+		case '}':
+			d--
+			if d == 0 {
+				return open + 1, clean[open+1 : i], true
+			}
+		}
+	}
+	return 0, "", false
+}
+
+// globalsFrom records global.name assignments and globalvar declarations.
+func (ix *Index) globalsFrom(path, text string) {
+	clines := strings.Split(stripNonCode(text), "\n")
+	for i, line := range clines {
+		line = strings.TrimSuffix(line, "\r")
+		for _, m := range reGlobalSet.FindAllStringSubmatchIndex(line, -1) {
+			if m[1] < len(line) && line[m[1]] == '=' {
+				continue // == comparison, not an assignment
+			}
+			ix.addGlobal(path, line[m[2]:m[3]], i, utf16Len(line[:m[2]]))
+		}
+		if m := reGlobalVar.FindStringSubmatchIndex(line); m != nil {
+			list := line[m[2]:m[3]]
+			for _, n := range strings.Split(list, ",") {
+				n = strings.TrimSpace(n)
+				if n == "" {
+					continue
+				}
+				if idx := strings.Index(list, n); idx >= 0 {
+					ix.addGlobal(path, n, i, utf16Len(line[:m[2]+idx]))
+				}
+			}
+		}
+	}
+}
+
+func (ix *Index) addGlobal(path, name string, line, col int) {
+	if _, ok := ix.globals[name]; ok {
+		return // first definition wins
+	}
+	ix.globals[name] = Sym{
+		Name: name, Container: "global", Path: path, Kind: kindConstant,
+		Line: line, Start: col, End: col + utf16Len(name),
+	}
 }
 
 // stamp records enough of a file's state to detect changes on disk.
@@ -365,6 +556,17 @@ func sortSyms(s []Sym) {
 	})
 }
 
+// lookupMember finds the named member of an enum, if it is defined in code
+// (built-in spec enums have no source location to jump to).
+func (ix *Index) lookupMember(qual, name string) *Sym {
+	for i := range ix.enums[qual] {
+		if ix.enums[qual][i].Name == name && ix.enums[qual][i].Path != "" {
+			return &ix.enums[qual][i]
+		}
+	}
+	return nil
+}
+
 // lookup finds declarations of name; falls back to assets.
 func (ix *Index) lookup(name string) []Sym {
 	var out []Sym
@@ -419,9 +621,17 @@ func isIdent(b byte) bool {
 
 // wordAt returns the identifier under the cursor (UTF-16 column).
 func wordAt(text string, line, col int) string {
+	word, _ := qualifiedWordAt(text, line, col)
+	return word
+}
+
+// qualifiedWordAt returns the identifier under the cursor plus, when it is
+// written as part of a dotted access (State.Idle, global.score), the qualifier
+// before the dot.
+func qualifiedWordAt(text string, line, col int) (word, qual string) {
 	lines := strings.Split(text, "\n")
 	if line < 0 || line >= len(lines) {
-		return ""
+		return "", ""
 	}
 	l := strings.TrimSuffix(lines[line], "\r")
 	i := utf16ToByte(l, col)
@@ -432,7 +642,15 @@ func wordAt(text string, line, col int) string {
 	for e < len(l) && isIdent(l[e]) {
 		e++
 	}
-	return l[s:e]
+	word = l[s:e]
+	if s > 0 && l[s-1] == '.' {
+		q := s - 1
+		for q > 0 && isIdent(l[q-1]) {
+			q--
+		}
+		qual = l[q : s-1]
+	}
+	return
 }
 
 func uriToPath(uri string) string {
