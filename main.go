@@ -192,13 +192,20 @@ func handle(raw []byte, out io.Writer) bool {
 		}
 		reply(map[string]any{
 			"capabilities": map[string]any{
-				"textDocumentSync":        1, // full sync
-				"documentSymbolProvider":  true,
-				"definitionProvider":      true,
-				"referencesProvider":      true,
-				"hoverProvider":           true,
-				"completionProvider":      map[string]any{"triggerCharacters": []string{"."}},
-				"signatureHelpProvider":   map[string]any{"triggerCharacters": []string{"(", ","}, "retriggerCharacters": []string{","}},
+				"textDocumentSync":       1, // full sync
+				"documentSymbolProvider": true,
+				"definitionProvider":     true,
+				"referencesProvider":     true,
+				"hoverProvider":          true,
+				"completionProvider":     map[string]any{"triggerCharacters": []string{"."}},
+				"signatureHelpProvider":  map[string]any{"triggerCharacters": []string{"(", ","}, "retriggerCharacters": []string{","}},
+				"semanticTokensProvider": map[string]any{
+					"legend": map[string]any{
+						"tokenTypes":     semanticLegend,
+						"tokenModifiers": []string{},
+					},
+					"full": true,
+				},
 				"workspaceSymbolProvider": true,
 			},
 			"serverInfo": map[string]string{"name": "gmlls", "version": "0.5.0"},
@@ -419,6 +426,14 @@ func handle(raw []byte, out io.Writer) bool {
 			"activeSignature": 0,
 			"activeParameter": active,
 		})
+
+	case "textDocument/semanticTokens/full":
+		var p struct {
+			TextDocument struct{ URI string } `json:"textDocument"`
+		}
+		json.Unmarshal(req.Params, &p)
+		path := uriToPath(p.TextDocument.URI)
+		reply(map[string]any{"data": index.semanticTokens(textOf(path))})
 
 	case "textDocument/completion":
 		var p struct {
