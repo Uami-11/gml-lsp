@@ -28,6 +28,8 @@ type Sym struct {
 	Line      int
 	Start     int
 	End       int
+	Detail    string // e.g. "move(dx, dy)" or a macro's value
+	Doc       string // text of /// comments directly above
 }
 
 type Index struct {
@@ -84,16 +86,51 @@ func utf16ToByte(s string, col int) int {
 	return len(s)
 }
 
+func detailOf(kind int, name, rest string) string {
+	switch kind {
+	case kindFunction, kindMethod:
+		i := strings.Index(rest, "(")
+		if i < 0 {
+			return name + "()"
+		}
+		after := rest[i+1:]
+		if j := strings.Index(after, ")"); j >= 0 {
+			after = after[:j]
+		}
+		return name + "(" + strings.TrimSpace(after) + ")"
+	case kindConstant:
+		return strings.TrimSpace(rest)
+	}
+	return ""
+}
+
+// docAbove collects consecutive /// lines directly above line i.
+func docAbove(lines []string, i int) string {
+	var doc []string
+	for j := i - 1; j >= 0; j-- {
+		t := strings.TrimSpace(strings.TrimSuffix(lines[j], "\r"))
+		if !strings.HasPrefix(t, "///") {
+			break
+		}
+		doc = append([]string{strings.TrimSpace(strings.TrimPrefix(t, "///"))}, doc...)
+	}
+	return strings.Join(doc, "\n")
+}
+
 func parseSymbols(path, text string) []Sym {
 	out := []Sym{}
-	for i, line := range strings.Split(text, "\n") {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
 		line = strings.TrimSuffix(line, "\r")
 		for _, d := range declRes {
 			if m := d.re.FindStringSubmatchIndex(line); m != nil {
+				name := line[m[2]:m[3]]
 				start := utf16Len(line[:m[2]])
 				out = append(out, Sym{
-					Name: line[m[2]:m[3]], Kind: d.kind, Path: path,
-					Line: i, Start: start, End: start + utf16Len(line[m[2]:m[3]]),
+					Name: name, Kind: d.kind, Path: path,
+					Line: i, Start: start, End: start + utf16Len(name),
+					Detail: detailOf(d.kind, name, line[m[3]:]),
+					Doc:    docAbove(lines, i),
 				})
 				break
 			}

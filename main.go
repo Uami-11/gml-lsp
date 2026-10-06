@@ -1,3 +1,4 @@
+// gmlls: a minimal GameMaker Language server (stdlib only).
 package main
 
 import (
@@ -111,7 +112,10 @@ func main() {
 		switch req.Method {
 		case "initialize":
 			var p struct {
-				RootURI          string `json:"rootUri"`
+				RootURI               string `json:"rootUri"`
+				InitializationOptions struct {
+					GMLSpec string `json:"gmlSpec"`
+				} `json:"initializationOptions"`
 				WorkspaceFolders []struct {
 					URI string `json:"uri"`
 				} `json:"workspaceFolders"`
@@ -126,10 +130,26 @@ func main() {
 					"textDocumentSync":        1, // full sync
 					"documentSymbolProvider":  true,
 					"definitionProvider":      true,
+					"referencesProvider":      true,
+					"hoverProvider":           true,
+					"completionProvider":      map[string]any{},
 					"workspaceSymbolProvider": true,
 				},
-				"serverInfo": map[string]string{"name": "gmlls", "version": "0.2.0"},
+				"serverInfo": map[string]string{"name": "gmlls", "version": "0.3.0"},
 			})
+			specPath := p.InitializationOptions.GMLSpec
+			if specPath == "" {
+				specPath = os.Getenv("GMLLS_SPEC")
+			}
+			if specPath != "" {
+				if n, err := loadSpec(specPath); err != nil {
+					logf("could not read spec %s: %v", specPath, err)
+				} else {
+					logf("loaded %d built-ins from %s", n, specPath)
+				}
+			} else {
+				logf("no GmlSpec.xml configured: built-in completion/hover disabled")
+			}
 			if root != "" {
 				index.indexRoot(uriToPath(root))
 				n := 0
@@ -208,6 +228,63 @@ func main() {
 				}
 			}
 			reply(res)
+
+		case "textDocument/references":
+			var p struct {
+				TextDocument struct{ URI string } `json:"textDocument"`
+				Position     Position             `json:"position"`
+				Context      struct {
+					IncludeDeclaration bool `json:"includeDeclaration"`
+				} `json:"context"`
+			}
+			json.Unmarshal(req.Params, &p)
+			res := []Location{}
+			path := uriToPath(p.TextDocument.URI)
+			if w := wordAt(textOf(path), p.Position.Line, p.Position.Character); w != "" {
+				res = index.references(w, p.Context.IncludeDeclaration)
+			}
+			reply(res)
+
+		case "textDocument/hover":
+			var p struct {
+				TextDocument struct{ URI string } `json:"textDocument"`
+				Position     Position             `json:"position"`
+			}
+			json.Unmarshal(req.Params, &p)
+			path := uriToPath(p.TextDocument.URI)
+			md := ""
+			if w := wordAt(textOf(path), p.Position.Line, p.Position.Character); w != "" {
+				md = index.hover(w)
+			}
+			if md == "" {
+				reply(nil)
+			} else {
+				reply(map[string]any{"contents": MarkupContent{"markdown", md}})
+			}
+
+		case "textDocument/completion":
+			var p struct {
+				TextDocument struct{ URI string } `json:"textDocument"`
+				Position     Position             `json:"position"`
+			}
+			json.Unmarshal(req.Params, &p)
+			path := uriToPath(p.TextDocument.URI)
+			list := CompletionList{IsIncomplete: true, Items: []CompletionItem{}}
+			lines := strings.Split(textOf(path), "\n")
+			if p.Position.Line >= 0 && p.Position.Line < len(lines) {
+				l := strings.TrimSuffix(lines[p.Position.Line], "\r")
+				end := utf16ToByte(l, p.Position.Character)
+				s := end
+				for s > 0 && isIdent(l[s-1]) {
+					s--
+				}
+				prefix := l[s:end]
+				// no flooding on empty prefix, numbers, or after '.' (struct fields unknown)
+				if prefix != "" && !(prefix[0] >= '0' && prefix[0] <= '9') && !(s > 0 && l[s-1] == '.') {
+					list.Items = index.complete(prefix, 200)
+				}
+			}
+			reply(list)
 
 		case "workspace/symbol":
 			var p struct {

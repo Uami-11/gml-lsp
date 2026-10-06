@@ -1,0 +1,415 @@
+package main
+
+import (
+	"encoding/xml"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+)
+
+// ---------- built-ins (loaded from the user's own GmlSpec.xml) ----------
+
+// CompletionItemKind values.
+const (
+	ckMethod   = 2
+	ckFunction = 3
+	ckVariable = 6
+	ckClass    = 7
+	ckModule   = 9
+	ckKeyword  = 14
+	ckEnum     = 13
+	ckConstant = 21
+)
+
+type Builtin struct {
+	Name string
+	Kind int
+	Sig  string
+	Doc  string
+}
+
+var builtins = map[string]Builtin{}
+
+var keywords = []string{
+	"if", "else", "for", "while", "do", "until", "repeat", "switch", "case", "default",
+	"break", "continue", "return", "exit", "with", "var", "globalvar", "static",
+	"function", "constructor", "new", "delete", "enum", "try", "catch", "finally",
+	"throw", "and", "or", "not", "xor", "mod", "div", "true", "false", "undefined",
+	"self", "other", "all", "noone", "global", "begin", "end", "then",
+}
+
+func xmlAttr(se xml.StartElement, names ...string) string {
+	for _, a := range se.Attr {
+		for _, n := range names {
+			if strings.EqualFold(a.Name.Local, n) {
+				return a.Value
+			}
+		}
+	}
+	return ""
+}
+
+// loadSpec reads GameMaker's GmlSpec.xml tolerantly: any <Function>,
+// <Constant> or <Variable> element with a Name attribute is taken, with
+// <Parameter> children and <Description> text where present.
+func loadSpec(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	dec := xml.NewDecoder(f)
+	dec.Strict = false
+
+	var cur *Builtin
+	var params []string
+	inDesc := false
+	count := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch strings.ToLower(t.Name.Local) {
+			case "function", "constant", "variable":
+				name := xmlAttr(t, "name")
+				if name == "" {
+					continue
+				}
+				kind := ckFunction
+				switch strings.ToLower(t.Name.Local) {
+				case "constant":
+					kind = ckConstant
+				case "variable":
+					kind = ckVariable
+				}
+				cur = &Builtin{Name: name, Kind: kind, Doc: xmlAttr(t, "description")}
+				params = nil
+			case "parameter", "argument":
+				if cur != nil {
+					p := xmlAttr(t, "name")
+					if strings.EqualFold(xmlAttr(t, "optional"), "true") {
+						p += "?"
+					}
+					if strings.EqualFold(xmlAttr(t, "varargs"), "true") {
+						p += "..."
+					}
+					params = append(params, p)
+				}
+			case "description":
+				inDesc = cur != nil
+			}
+		case xml.CharData:
+			if inDesc && cur != nil {
+				cur.Doc += strings.TrimSpace(string(t)) + " "
+			}
+		case xml.EndElement:
+			switch strings.ToLower(t.Name.Local) {
+			case "description":
+				inDesc = false
+			case "function", "constant", "variable":
+				if cur != nil {
+					if cur.Kind == ckFunction {
+						cur.Sig = cur.Name + "(" + strings.Join(params, ", ") + ")"
+					}
+					cur.Doc = strings.TrimSpace(cur.Doc)
+					builtins[cur.Name] = *cur
+					count++
+					cur = nil
+				}
+			}
+		}
+	}
+	return count, nil
+}
+
+// ---------- comment/string stripping + references ----------
+
+// stripNonCode blanks out comments and string literals, keeping every byte
+// offset and newline in place so positions still line up with the original.
+func stripNonCode(s string) string {
+	const (
+		code = iota
+		lineC
+		blockC
+		dq
+		sq
+	)
+	b := []byte(s)
+	st := code
+	blank := func(i int) {
+		if b[i] != '\n' && b[i] != '\r' {
+			b[i] = ' '
+		}
+	}
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		var next byte
+		if i+1 < len(b) {
+			next = b[i+1]
+		}
+		switch st {
+		case code:
+			switch {
+			case c == '/' && next == '/':
+				st = lineC
+				blank(i)
+				blank(i + 1)
+				i++
+			case c == '/' && next == '*':
+				st = blockC
+				blank(i)
+				blank(i + 1)
+				i++
+			case c == '"':
+				st = dq
+				blank(i)
+			case c == '\'':
+				st = sq
+				blank(i)
+			}
+		case lineC:
+			if c == '\n' {
+				st = code
+			} else {
+				blank(i)
+			}
+		case blockC:
+			if c == '*' && next == '/' {
+				blank(i)
+				blank(i + 1)
+				i++
+				st = code
+			} else {
+				blank(i)
+			}
+		case dq, sq:
+			q := byte('"')
+			if st == sq {
+				q = '\''
+			}
+			switch {
+			case c == '\\' && next != 0 && next != '\n':
+				blank(i)
+				blank(i + 1)
+				i++
+			case c == q:
+				blank(i)
+				st = code
+			case c == '\n':
+				st = code // unterminated string: recover at end of line
+			default:
+				blank(i)
+			}
+		}
+	}
+	return string(b)
+}
+
+// references finds whole-word uses of word in code (not comments/strings)
+// across every indexed .gml file.
+func (ix *Index) references(word string, includeDecl bool) []Location {
+	decl := map[[3]any]bool{}
+	if !includeDecl {
+		for _, s := range ix.lookup(word) {
+			decl[[3]any{s.Path, s.Line, s.Start}] = true
+		}
+	}
+	paths := make([]string, 0, len(ix.files))
+	for p := range ix.files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	var out []Location
+	for _, p := range paths {
+		text := textOf(p)
+		orig := strings.Split(text, "\n")
+		for i, sl := range strings.Split(stripNonCode(text), "\n") {
+			for from := 0; ; {
+				k := strings.Index(sl[from:], word)
+				if k < 0 {
+					break
+				}
+				b := from + k
+				e := b + len(word)
+				from = e
+				if b > 0 && isIdent(sl[b-1]) || e < len(sl) && isIdent(sl[e]) {
+					continue
+				}
+				start := utf16Len(orig[i][:b])
+				if decl[[3]any{p, i, start}] {
+					continue
+				}
+				out = append(out, Location{pathToURI(p), Range{
+					Position{i, start}, Position{i, start + utf16Len(word)},
+				}})
+			}
+		}
+	}
+	return out
+}
+
+// ---------- completion ----------
+
+type MarkupContent struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+}
+type CompletionItem struct {
+	Label         string         `json:"label"`
+	Kind          int            `json:"kind"`
+	Detail        string         `json:"detail,omitempty"`
+	Documentation *MarkupContent `json:"documentation,omitempty"`
+	SortText      string         `json:"sortText,omitempty"`
+}
+type CompletionList struct {
+	IsIncomplete bool             `json:"isIncomplete"`
+	Items        []CompletionItem `json:"items"`
+}
+
+// matchScore: 0 prefix, 1 substring, 2 subsequence, -1 no match.
+func matchScore(name, prefix string) int {
+	n, p := strings.ToLower(name), strings.ToLower(prefix)
+	switch {
+	case strings.HasPrefix(n, p):
+		return 0
+	case strings.Contains(n, p):
+		return 1
+	}
+	j := 0
+	for i := 0; i < len(n) && j < len(p); i++ {
+		if n[i] == p[j] {
+			j++
+		}
+	}
+	if j == len(p) {
+		return 2
+	}
+	return -1
+}
+
+func completionKind(s Sym) int {
+	switch s.Kind {
+	case kindFunction:
+		return ckFunction
+	case kindMethod:
+		return ckMethod
+	case kindEnum:
+		return ckEnum
+	case kindClass:
+		return ckClass
+	case kindModule:
+		return ckModule
+	}
+	return ckConstant
+}
+
+func (ix *Index) complete(prefix string, limit int) []CompletionItem {
+	type cand struct {
+		item  CompletionItem
+		score int
+		rank  int
+	}
+	seen := map[string]bool{}
+	var cands []cand
+	add := func(it CompletionItem, rank int) {
+		if seen[it.Label] {
+			return
+		}
+		if sc := matchScore(it.Label, prefix); sc >= 0 {
+			seen[it.Label] = true
+			cands = append(cands, cand{it, sc, rank})
+		}
+	}
+	symItem := func(s Sym) CompletionItem {
+		it := CompletionItem{Label: s.Name, Kind: completionKind(s), Detail: s.Detail}
+		if s.Container != "" {
+			it.Detail = s.Container
+		}
+		if s.Doc != "" {
+			it.Documentation = &MarkupContent{"markdown", s.Doc}
+		}
+		return it
+	}
+	paths := make([]string, 0, len(ix.files))
+	for p := range ix.files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		for _, s := range ix.files[p] {
+			add(symItem(s), 0)
+		}
+	}
+	for _, a := range ix.assets {
+		add(symItem(a), 0)
+	}
+	for _, k := range keywords {
+		add(CompletionItem{Label: k, Kind: ckKeyword}, 1)
+	}
+	for _, b := range builtins {
+		it := CompletionItem{Label: b.Name, Kind: b.Kind, Detail: b.Sig}
+		if b.Doc != "" {
+			it.Documentation = &MarkupContent{"markdown", b.Doc}
+		}
+		add(it, 2)
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.score != b.score {
+			return a.score < b.score
+		}
+		if a.rank != b.rank {
+			return a.rank < b.rank
+		}
+		return a.item.Label < b.item.Label
+	})
+	if len(cands) > limit {
+		cands = cands[:limit]
+	}
+	out := make([]CompletionItem, len(cands))
+	for i, c := range cands {
+		c.item.SortText = fmt.Sprintf("%04d", i)
+		out[i] = c.item
+	}
+	return out
+}
+
+// ---------- hover ----------
+
+func (ix *Index) hover(word string) string {
+	if syms := ix.lookup(word); len(syms) > 0 {
+		s := syms[0]
+		var md string
+		switch {
+		case s.Container != "":
+			return fmt.Sprintf("**%s** — %s asset", s.Name, s.Container)
+		case s.Kind == kindFunction || s.Kind == kindMethod:
+			md = "```gml\nfunction " + s.Detail + "\n```"
+		case s.Kind == kindEnum:
+			md = "```gml\nenum " + s.Name + "\n```"
+		default:
+			md = "```gml\n#macro " + s.Name + " " + s.Detail + "\n```"
+		}
+		if s.Doc != "" {
+			md += "\n\n" + s.Doc
+		}
+		return md
+	}
+	if b, ok := builtins[word]; ok {
+		sig := b.Sig
+		if sig == "" {
+			sig = b.Name
+		}
+		md := "```gml\n" + sig + "\n```"
+		if b.Doc != "" {
+			md += "\n\n" + b.Doc
+		}
+		return md
+	}
+	return ""
+}
