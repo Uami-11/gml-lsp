@@ -59,6 +59,14 @@ var (
 	// tickCh fires every rescanSeconds after initialize (nil disables it).
 	tickTimer *time.Ticker
 	tickCh    <-chan time.Time
+
+	// Diagnostics are pushed for open buffers; serverOut is only written by
+	// the main goroutine (set at serve).
+	serverOut   io.Writer
+	diagEnabled = true
+	ignoreSet   = map[string]bool{}
+	diagTimer   *time.Timer
+	diagCh      <-chan time.Time
 )
 
 func logf(f string, a ...any) { fmt.Fprintf(os.Stderr, "[gmlls] "+f+"\n", a...) }
@@ -105,6 +113,13 @@ func textOf(path string) string {
 func isGML(path string) bool { return strings.HasSuffix(path, ".gml") }
 
 func main() {
+	if len(os.Args) >= 3 && os.Args[1] == "-check" {
+		spec := os.Getenv("GMLLS_SPEC")
+		if len(os.Args) >= 4 {
+			spec = os.Args[3]
+		}
+		os.Exit(runCheck(os.Args[2], spec))
+	}
 	if err := serve(os.Stdin, os.Stdout); err != nil {
 		logf("server error: %v", err)
 		os.Exit(1)
@@ -115,6 +130,7 @@ func main() {
 // touched only on this goroutine; the reader goroutine only feeds raw messages
 // into the msgs channel.
 func serve(in io.Reader, out io.Writer) error {
+	serverOut = out
 	msgs := make(chan []byte)
 	go func() { // reader goroutine: only reads stdin
 		br := bufio.NewReader(in)
@@ -139,6 +155,10 @@ func serve(in io.Reader, out io.Writer) error {
 			}
 		case <-tickCh:
 			rescan()
+		case <-diagCh:
+			diagCh = nil
+			diagTimer = nil
+			publishBuffers(index.knownSet())
 		}
 	}
 }
@@ -156,8 +176,10 @@ func handle(raw []byte, out io.Writer) bool {
 		var p struct {
 			RootURI               string `json:"rootUri"`
 			InitializationOptions struct {
-				GMLSpec       string `json:"gmlSpec"`
-				RescanSeconds *int   `json:"rescanSeconds"`
+				GMLSpec       string   `json:"gmlSpec"`
+				RescanSeconds *int     `json:"rescanSeconds"`
+				Diagnostics   *bool    `json:"diagnostics"`
+				Ignore        []string `json:"ignore"`
 			} `json:"initializationOptions"`
 			WorkspaceFolders []struct {
 				URI string `json:"uri"`
@@ -208,6 +230,13 @@ func handle(raw []byte, out io.Writer) bool {
 		} else {
 			tickCh = nil
 		}
+		if p.InitializationOptions.Diagnostics != nil {
+			diagEnabled = *p.InitializationOptions.Diagnostics
+		}
+		ignoreSet = map[string]bool{}
+		for _, n := range p.InitializationOptions.Ignore {
+			ignoreSet[n] = true
+		}
 		if projectRoot != "" {
 			dir := uriToPath(projectRoot)
 			index.indexRoot(dir)
@@ -234,6 +263,7 @@ func handle(raw []byte, out io.Writer) bool {
 		docs[path] = p.TextDocument.Text
 		if isGML(path) {
 			index.indexText(path, p.TextDocument.Text)
+			publishBuffers(index.knownSet())
 		}
 	case "textDocument/didChange":
 		var p struct {
@@ -246,6 +276,7 @@ func handle(raw []byte, out io.Writer) bool {
 			docs[path] = p.ContentChanges[n-1].Text
 			if isGML(path) {
 				index.indexText(path, docs[path])
+				scheduleDiagnostics()
 			}
 		}
 	case "textDocument/didClose":
@@ -257,6 +288,7 @@ func handle(raw []byte, out io.Writer) bool {
 		delete(docs, path)
 		if isGML(path) {
 			index.indexFile(path) // drop unsaved edits; trust disk again
+			clearDiagnostics(path)
 		}
 
 	case "textDocument/documentSymbol":

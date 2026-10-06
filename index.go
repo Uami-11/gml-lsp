@@ -36,23 +36,25 @@ type Sym struct {
 }
 
 type Index struct {
-	files   map[string][]Sym // .gml path -> symbols declared in it
-	assets  map[string]Sym   // asset name -> asset
-	enums   map[string][]Sym // enum name -> member symbols
-	globals map[string]Sym   // global.name -> symbol (first definition wins)
+	files        map[string][]Sym // .gml path -> symbols declared in it
+	assets       map[string]Sym   // asset name -> asset
+	enums        map[string][]Sym // enum name -> member symbols
+	globals      map[string]Sym   // global.name -> symbol (first definition wins)
+	extensionFns map[string]bool  // callable names from extension .yy files
 }
 
 func newIndex() *Index {
 	return &Index{
-		files:   map[string][]Sym{},
-		assets:  map[string]Sym{},
-		enums:   map[string][]Sym{},
-		globals: map[string]Sym{},
+		files:        map[string][]Sym{},
+		assets:       map[string]Sym{},
+		enums:        map[string][]Sym{},
+		globals:      map[string]Sym{},
+		extensionFns: map[string]bool{},
 	}
 }
 
 var (
-	reFunc       = regexp.MustCompile(`^\s*function\s+([A-Za-z_]\w*)\s*\(`)
+	reFunc       = regexp.MustCompile(`^\s*(?:static\s+)?function\s+([A-Za-z_]\w*)\s*\(`)
 	reAssignFunc = regexp.MustCompile(`^\s*(?:static\s+)?([A-Za-z_]\w*)\s*=\s*function\s*\(`)
 	reMacro      = regexp.MustCompile(`^\s*#macro\s+([A-Za-z_]\w*)`)
 	reEnum       = regexp.MustCompile(`^\s*enum\s+([A-Za-z_]\w*)`)
@@ -517,6 +519,8 @@ func rescan() {
 	// Assets are cheap to rebuild: just directory listings.
 	index.assets = map[string]Sym{}
 	index.indexAssets(root)
+	index.indexExtensions(root)
+	publishBuffers(index.knownSet())
 	if d := time.Since(start); d > 50*time.Millisecond {
 		logf("rescan took %v", d)
 	}
@@ -529,6 +533,7 @@ func (ix *Index) dropFile(path string) {
 
 func (ix *Index) indexRoot(root string) {
 	ix.indexAssets(root)
+	ix.indexExtensions(root)
 	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
