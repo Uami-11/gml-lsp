@@ -201,7 +201,7 @@ func handle(raw []byte, out io.Writer) bool {
 				"signatureHelpProvider":   map[string]any{"triggerCharacters": []string{"(", ","}, "retriggerCharacters": []string{","}},
 				"workspaceSymbolProvider": true,
 			},
-			"serverInfo": map[string]string{"name": "gmlls", "version": "0.4.0"},
+			"serverInfo": map[string]string{"name": "gmlls", "version": "0.5.0"},
 		})
 		specPath := p.InitializationOptions.GMLSpec
 		if specPath == "" {
