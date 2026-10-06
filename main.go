@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -31,36 +30,32 @@ type Range struct {
 	Start Position `json:"start"`
 	End   Position `json:"end"`
 }
+type Location struct {
+	URI   string `json:"uri"`
+	Range Range  `json:"range"`
+}
 type DocumentSymbol struct {
 	Name           string `json:"name"`
 	Kind           int    `json:"kind"`
 	Range          Range  `json:"range"`
 	SelectionRange Range  `json:"selectionRange"`
 }
-
-var docs = map[string]string{} // uri -> full text
+type SymbolInformation struct {
+	Name          string   `json:"name"`
+	Kind          int      `json:"kind"`
+	Location      Location `json:"location"`
+	ContainerName string   `json:"containerName,omitempty"`
+}
 
 var (
-	reFunc  = regexp.MustCompile(`^\s*function\s+([A-Za-z_]\w*)\s*\(`)
-	reMacro = regexp.MustCompile(`^\s*#macro\s+([A-Za-z_]\w*)`)
-	reEnum  = regexp.MustCompile(`^\s*enum\s+([A-Za-z_]\w*)`)
+	docs  = map[string]string{} // path -> text of open buffers
+	index = newIndex()
 )
 
-func symbols(text string) []DocumentSymbol {
-	out := []DocumentSymbol{}
-	for i, line := range strings.Split(text, "\n") {
-		add := func(re *regexp.Regexp, kind int) {
-			if m := re.FindStringSubmatchIndex(line); m != nil {
-				r := Range{Position{i, m[2]}, Position{i, m[3]}}
-				out = append(out, DocumentSymbol{line[m[2]:m[3]], kind, Range{Position{i, 0}, Position{i, len(line)}}, r})
-			}
-		}
-		add(reFunc, 12)  // Function
-		add(reMacro, 14) // Constant
-		add(reEnum, 10)  // Enum
-	}
-	return out
+func (s Sym) selRange() Range {
+	return Range{Position{s.Line, s.Start}, Position{s.Line, s.End}}
 }
+func (s Sym) location() Location { return Location{pathToURI(s.Path), s.selRange()} }
 
 func send(w io.Writer, v any) {
 	b, _ := json.Marshal(v)
@@ -87,9 +82,21 @@ func readMsg(r *bufio.Reader) ([]byte, error) {
 	return buf, err
 }
 
+// textOf returns the buffer text if open, else the file on disk.
+func textOf(path string) string {
+	if t, ok := docs[path]; ok {
+		return t
+	}
+	b, _ := os.ReadFile(path)
+	return string(b)
+}
+
+func isGML(path string) bool { return strings.HasSuffix(path, ".gml") }
+
 func main() {
 	in, out := bufio.NewReader(os.Stdin), os.Stdout
-	log := func(f string, a ...any) { fmt.Fprintf(os.Stderr, "[gmlls] "+f+"\n", a...) }
+	logf := func(f string, a ...any) { fmt.Fprintf(os.Stderr, "[gmlls] "+f+"\n", a...) }
+
 	for {
 		raw, err := readMsg(in)
 		if err != nil {
@@ -103,45 +110,116 @@ func main() {
 
 		switch req.Method {
 		case "initialize":
+			var p struct {
+				RootURI          string `json:"rootUri"`
+				WorkspaceFolders []struct {
+					URI string `json:"uri"`
+				} `json:"workspaceFolders"`
+			}
+			json.Unmarshal(req.Params, &p)
+			root := p.RootURI
+			if len(p.WorkspaceFolders) > 0 {
+				root = p.WorkspaceFolders[0].URI
+			}
 			reply(map[string]any{
 				"capabilities": map[string]any{
-					"textDocumentSync":       1, // full sync
-					"documentSymbolProvider": true,
+					"textDocumentSync":        1, // full sync
+					"documentSymbolProvider":  true,
+					"definitionProvider":      true,
+					"workspaceSymbolProvider": true,
 				},
-				"serverInfo": map[string]string{"name": "gmlls"},
+				"serverInfo": map[string]string{"name": "gmlls", "version": "0.2.0"},
 			})
+			if root != "" {
+				index.indexRoot(uriToPath(root))
+				n := 0
+				for _, s := range index.files {
+					n += len(s)
+				}
+				logf("indexed %s: %d files, %d symbols, %d assets",
+					uriToPath(root), len(index.files), n, len(index.assets))
+			}
+
 		case "shutdown":
 			reply(nil)
 		case "exit":
 			return
+
 		case "textDocument/didOpen":
 			var p struct {
 				TextDocument struct{ URI, Text string } `json:"textDocument"`
 			}
 			json.Unmarshal(req.Params, &p)
-			docs[p.TextDocument.URI] = p.TextDocument.Text
-			log("opened %s", p.TextDocument.URI)
+			path := uriToPath(p.TextDocument.URI)
+			docs[path] = p.TextDocument.Text
+			if isGML(path) {
+				index.indexText(path, p.TextDocument.Text)
+			}
 		case "textDocument/didChange":
 			var p struct {
 				TextDocument   struct{ URI string }    `json:"textDocument"`
 				ContentChanges []struct{ Text string } `json:"contentChanges"`
 			}
 			json.Unmarshal(req.Params, &p)
+			path := uriToPath(p.TextDocument.URI)
 			if n := len(p.ContentChanges); n > 0 {
-				docs[p.TextDocument.URI] = p.ContentChanges[n-1].Text
+				docs[path] = p.ContentChanges[n-1].Text
+				if isGML(path) {
+					index.indexText(path, docs[path])
+				}
 			}
 		case "textDocument/didClose":
 			var p struct {
 				TextDocument struct{ URI string } `json:"textDocument"`
 			}
 			json.Unmarshal(req.Params, &p)
-			delete(docs, p.TextDocument.URI)
+			path := uriToPath(p.TextDocument.URI)
+			delete(docs, path)
+			if isGML(path) {
+				index.indexFile(path) // drop unsaved edits; trust disk again
+			}
+
 		case "textDocument/documentSymbol":
 			var p struct {
 				TextDocument struct{ URI string } `json:"textDocument"`
 			}
 			json.Unmarshal(req.Params, &p)
-			reply(symbols(docs[p.TextDocument.URI]))
+			path := uriToPath(p.TextDocument.URI)
+			res := []DocumentSymbol{}
+			for _, s := range parseSymbols(path, textOf(path)) {
+				res = append(res, DocumentSymbol{
+					Name: s.Name, Kind: s.Kind, SelectionRange: s.selRange(),
+					Range: Range{Position{s.Line, 0}, Position{s.Line, s.End}},
+				})
+			}
+			reply(res)
+
+		case "textDocument/definition":
+			var p struct {
+				TextDocument struct{ URI string } `json:"textDocument"`
+				Position     Position             `json:"position"`
+			}
+			json.Unmarshal(req.Params, &p)
+			path := uriToPath(p.TextDocument.URI)
+			res := []Location{}
+			if w := wordAt(textOf(path), p.Position.Line, p.Position.Character); w != "" {
+				for _, s := range index.lookup(w) {
+					res = append(res, s.location())
+				}
+			}
+			reply(res)
+
+		case "workspace/symbol":
+			var p struct {
+				Query string `json:"query"`
+			}
+			json.Unmarshal(req.Params, &p)
+			res := []SymbolInformation{}
+			for _, s := range index.search(p.Query, 500) {
+				res = append(res, SymbolInformation{s.Name, s.Kind, s.location(), s.Container})
+			}
+			reply(res)
+
 		default:
 			if len(req.ID) > 0 { // unknown request: must still answer
 				reply(nil)
