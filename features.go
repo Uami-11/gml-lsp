@@ -23,10 +23,11 @@ const (
 )
 
 type Builtin struct {
-	Name string
-	Kind int
-	Sig  string
-	Doc  string
+	Name   string
+	Kind   int
+	Sig    string
+	Params []string
+	Doc    string
 }
 
 var builtins = map[string]Builtin{}
@@ -115,6 +116,11 @@ func loadSpec(path string) (int, error) {
 					if cur.Kind == ckFunction {
 						cur.Sig = cur.Name + "(" + strings.Join(params, ", ") + ")"
 					}
+					ps := params
+					if ps == nil {
+						ps = []string{}
+					}
+					cur.Params = ps
 					cur.Doc = strings.TrimSpace(cur.Doc)
 					builtins[cur.Name] = *cur
 					count++
@@ -377,6 +383,92 @@ func (ix *Index) complete(prefix string, limit int) []CompletionItem {
 		out[i] = c.item
 	}
 	return out
+}
+
+// ---------- signature help ----------
+
+// callContext returns the name of the call enclosing offset off and the index
+// of the parameter the cursor is inside (comma count at the same nesting
+// depth), plus the byte offset of the callee identifier. ok is false when the
+// cursor is not inside a call. The scan crosses newlines and is capped at
+// 4000 bytes; run it on stripNonCode(text) so strings and comments don't
+// confuse the nesting.
+func callContext(code string, off int) (name string, arg, calleeStart int, ok bool) {
+	depth := 0
+	for i := off - 1; i >= 0 && off-i < 4000; i-- {
+		switch code[i] {
+		case ')', ']', '}':
+			depth++
+		case '[', '{':
+			if depth == 0 {
+				return "", 0, 0, false
+			}
+			depth--
+		case '(':
+			if depth > 0 {
+				depth--
+				continue
+			}
+			// unmatched '(' : the identifier before it is the callee
+			j := i
+			for j > 0 && (code[j-1] == ' ' || code[j-1] == '\t') {
+				j--
+			}
+			e := j
+			for j > 0 && isIdent(code[j-1]) {
+				j--
+			}
+			return code[j:e], arg, j, j < e
+		case ',':
+			if depth == 0 {
+				arg++
+			}
+		}
+	}
+	return "", 0, 0, false
+}
+
+func isKeyword(w string) bool {
+	for _, k := range keywords {
+		if k == w {
+			return true
+		}
+	}
+	return false
+}
+
+// isDeclaration reports whether the callee at nameStart is written as a
+// `function NAME(` declaration rather than a call.
+func isDeclaration(clean string, nameStart int) bool {
+	i := nameStart - 1
+	for i >= 0 && (clean[i] == ' ' || clean[i] == '\t') {
+		i--
+	}
+	if i < 0 || !isIdent(clean[i]) {
+		return false
+	}
+	e := i + 1
+	for i >= 0 && isIdent(clean[i]) {
+		i--
+	}
+	return clean[i+1:e] == "function"
+}
+
+// signature finds the parameter list for a callable name: a project function
+// or method first, then a built-in function. Constructors work too, since
+// `new Foo(` is just a call to Foo.
+func (ix *Index) signature(name string) ([]string, string, bool) {
+	for _, syms := range ix.files {
+		for _, s := range syms {
+			if s.Name == name && (s.Kind == kindFunction || s.Kind == kindMethod) {
+				return s.Params, s.Detail, true
+			}
+		}
+	}
+	if b, ok := builtins[name]; ok && b.Kind == ckFunction {
+		return b.Params, b.Sig, true
+	}
+	return nil, "", false
 }
 
 // ---------- hover ----------

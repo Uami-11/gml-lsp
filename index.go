@@ -29,8 +29,9 @@ type Sym struct {
 	Line      int
 	Start     int
 	End       int
-	Detail    string // e.g. "move(dx, dy)" or a macro's value
-	Doc       string // text of /// comments directly above
+	Detail    string   // e.g. "move(dx, dy)" or a macro's value
+	Params    []string // parameter names, for functions and methods
+	Doc       string   // text of /// comments directly above
 }
 
 type Index struct {
@@ -87,24 +88,6 @@ func utf16ToByte(s string, col int) int {
 	return len(s)
 }
 
-func detailOf(kind int, name, rest string) string {
-	switch kind {
-	case kindFunction, kindMethod:
-		i := strings.Index(rest, "(")
-		if i < 0 {
-			return name + "()"
-		}
-		after := rest[i+1:]
-		if j := strings.Index(after, ")"); j >= 0 {
-			after = after[:j]
-		}
-		return name + "(" + strings.TrimSpace(after) + ")"
-	case kindConstant:
-		return strings.TrimSpace(rest)
-	}
-	return ""
-}
-
 // docAbove collects consecutive /// lines directly above line i.
 func docAbove(lines []string, i int) string {
 	var doc []string
@@ -119,25 +102,110 @@ func docAbove(lines []string, i int) string {
 }
 
 func parseSymbols(path, text string) []Sym {
-	out := []Sym{}
+	clean := stripNonCode(text) // declarations must be real code, not comments/strings
+	clines := strings.Split(clean, "\n")
 	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		line = strings.TrimSuffix(line, "\r")
+	out := []Sym{}
+	lineStart := 0
+	for i, cline := range clines {
+		cline = strings.TrimSuffix(cline, "\r")
 		for _, d := range declRes {
-			if m := d.re.FindStringSubmatchIndex(line); m != nil {
-				name := line[m[2]:m[3]]
-				start := utf16Len(line[:m[2]])
+			if m := d.re.FindStringSubmatchIndex(cline); m != nil {
+				name := cline[m[2]:m[3]]
+				start := utf16Len(cline[:m[2]])
+				params := paramList(clean, lineStart+m[3])
+				det := name + "(" + strings.Join(params, ", ") + ")"
+				if d.kind == kindConstant {
+					det = strings.TrimSpace(cline[m[3]:])
+				}
 				out = append(out, Sym{
 					Name: name, Kind: d.kind, Path: path,
 					Line: i, Start: start, End: start + utf16Len(name),
-					Detail: detailOf(d.kind, name, line[m[3]:]),
-					Doc:    docAbove(lines, i),
+					Detail: det, Params: params,
+					Doc: docAbove(lines, i),
 				})
 				break
 			}
 		}
+		lineStart += len(clines[i]) + 1
 	}
 	return out
+}
+
+// paramList returns the parameter list of the call or declaration whose name
+// ends at byte offset end in clean (signatures start on the same line).
+func paramList(clean string, end int) []string {
+	for i := end; i < len(clean) && clean[i] != '\n'; i++ {
+		if clean[i] == '(' {
+			if ps, ok := scanParams(clean, i); ok {
+				return ps
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// scanParams returns the top-level comma-separated pieces between the '(' at
+// byte offset open and its matching ')' in clean.
+func scanParams(clean string, open int) ([]string, bool) {
+	depth := 0
+	for i := open; i < len(clean); i++ {
+		switch clean[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return splitTopLevel(clean[open+1:i], ','), true
+			}
+		}
+	}
+	return nil, false
+}
+
+// splitTopLevel splits s on sep, ignoring separators nested inside (), [] or {}.
+// Defaults like a = max(1, 2) survive because the split is depth-aware.
+func splitTopLevel(s string, sep byte) []string {
+	var out []string
+	d := 0
+	last := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[', '{':
+			d++
+		case ')', ']', '}':
+			d--
+		case sep:
+			if d == 0 {
+				out = append(out, strings.TrimSpace(s[last:i]))
+				last = i + 1
+			}
+		}
+	}
+	out = append(out, strings.TrimSpace(s[last:]))
+	res := out[:0]
+	for _, p := range out {
+		if p != "" {
+			res = append(res, p)
+		}
+	}
+	return res
+}
+
+// posToOffset converts an LSP position (line, UTF-16 column) into a byte
+// offset into the whole text.
+func posToOffset(text string, p Position) int {
+	lines := strings.Split(text, "\n")
+	if p.Line < 0 || p.Line >= len(lines) {
+		return len(text)
+	}
+	off := 0
+	for i := 0; i < p.Line; i++ {
+		off += len(lines[i]) + 1
+	}
+	l := strings.TrimSuffix(lines[p.Line], "\r")
+	return off + utf16ToByte(l, p.Character)
 }
 
 // GameMaker keeps each asset in <type-dir>/<name>/.

@@ -176,6 +176,7 @@ func handle(raw []byte, out io.Writer) bool {
 				"referencesProvider":      true,
 				"hoverProvider":           true,
 				"completionProvider":      map[string]any{},
+				"signatureHelpProvider":   map[string]any{"triggerCharacters": []string{"(", ","}, "retriggerCharacters": []string{","}},
 				"workspaceSymbolProvider": true,
 			},
 			"serverInfo": map[string]string{"name": "gmlls", "version": "0.4.0"},
@@ -320,6 +321,43 @@ func handle(raw []byte, out io.Writer) bool {
 		} else {
 			reply(map[string]any{"contents": MarkupContent{"markdown", md}})
 		}
+
+	case "textDocument/signatureHelp":
+		var p struct {
+			TextDocument struct{ URI string } `json:"textDocument"`
+			Position     Position             `json:"position"`
+		}
+		json.Unmarshal(req.Params, &p)
+		path := uriToPath(p.TextDocument.URI)
+		text := textOf(path)
+		clean := stripNonCode(text)
+		name, arg, calleeStart, ok := callContext(clean, posToOffset(text, p.Position))
+		if !ok || isKeyword(name) || isDeclaration(clean, calleeStart) {
+			reply(nil) // no call context: let the popup close
+			break
+		}
+		params, label, found := index.signature(name)
+		if !found {
+			reply(nil)
+			break
+		}
+		active := arg
+		if n := len(params); n > 0 {
+			if active > n-1 {
+				active = n - 1
+			}
+		} else {
+			active = 0
+		}
+		pl := []any{}
+		for _, pn := range params {
+			pl = append(pl, map[string]any{"label": pn})
+		}
+		reply(map[string]any{
+			"signatures":      []any{map[string]any{"label": label, "parameters": pl}},
+			"activeSignature": 0,
+			"activeParameter": active,
+		})
 
 	case "textDocument/completion":
 		var p struct {
