@@ -196,6 +196,10 @@ func (ix *Index) indexText(path, text string) {
 	ix.files[path] = parseSymbols(path, text)
 }
 
+// rescan re-reads project files that changed on disk since the last scan.
+// Called on the rescan ticker; currently a no-op placeholder.
+func rescan() {}
+
 func (ix *Index) indexRoot(root string) {
 	ix.indexAssets(root)
 	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
