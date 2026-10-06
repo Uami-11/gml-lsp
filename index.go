@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // LSP SymbolKind values we use.
@@ -196,9 +197,76 @@ func (ix *Index) indexText(path, text string) {
 	ix.files[path] = parseSymbols(path, text)
 }
 
-// rescan re-reads project files that changed on disk since the last scan.
-// Called on the rescan ticker; currently a no-op placeholder.
-func rescan() {}
+// stamp records enough of a file's state to detect changes on disk.
+type stamp struct {
+	mod  time.Time
+	size int64
+}
+
+// seen is the last scan's snapshot of every .gml file's stamp.
+var seen = map[string]stamp{}
+
+// stampGMLs walks root and returns a stamp for every .gml file, skipping
+// directories that are never part of the project.
+func stampGMLs(root string) map[string]stamp {
+	now := map[string]stamp{}
+	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "datafiles", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(p, ".gml") {
+			if info, err := d.Info(); err == nil {
+				now[p] = stamp{info.ModTime(), info.Size()}
+			}
+		}
+		return nil
+	})
+	return now
+}
+
+// rescan re-indexes .gml files whose stamp changed since the last scan,
+// drops files that disappeared, and refreshes the asset listings. Files open
+// in the editor are skipped: their buffers are the source of truth until
+// didClose re-reads from disk.
+func rescan() {
+	if projectRoot == "" {
+		return
+	}
+	start := time.Now()
+	root := uriToPath(projectRoot)
+	now := stampGMLs(root)
+	for p, s := range now {
+		if seen[p] != s {
+			if _, open := docs[p]; !open {
+				index.indexFile(p)
+			}
+		}
+	}
+	for p := range seen {
+		if _, ok := now[p]; !ok {
+			index.dropFile(p)
+		}
+	}
+	seen = now
+	// Assets are cheap to rebuild: just directory listings.
+	index.assets = map[string]Sym{}
+	index.indexAssets(root)
+	if d := time.Since(start); d > 50*time.Millisecond {
+		logf("rescan took %v", d)
+	}
+}
+
+// dropFile removes all indexed data for a path.
+func (ix *Index) dropFile(path string) {
+	delete(ix.files, path)
+}
 
 func (ix *Index) indexRoot(root string) {
 	ix.indexAssets(root)

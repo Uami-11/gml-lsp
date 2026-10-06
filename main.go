@@ -210,6 +210,7 @@ func handle(raw []byte, out io.Writer) bool {
 		if projectRoot != "" {
 			dir := uriToPath(projectRoot)
 			index.indexRoot(dir)
+			seen = stampGMLs(dir) // first tick must not re-index everything
 			n := 0
 			for _, s := range index.files {
 				n += len(s)
@@ -343,6 +344,14 @@ func handle(raw []byte, out io.Writer) bool {
 			}
 		}
 		reply(list)
+
+	case "workspace/didChangeWatchedFiles":
+		// Some clients watch files; treat the notification as a request to
+		// rescan right now. Polling on the ticker covers the rest.
+		rescan()
+		if len(req.ID) > 0 {
+			reply(nil)
+		}
 
 	case "workspace/symbol":
 		var p struct {
