@@ -392,7 +392,8 @@ func handle(raw []byte, out io.Writer) bool {
 		text := textOf(path)
 		clean := stripNonCode(text)
 		name, arg, calleeStart, ok := callContext(clean, posToOffset(text, p.Position))
-		if !ok || isKeyword(name) || isDeclaration(clean, calleeStart) {
+		if !ok || isKeyword(name) || isDeclaration(clean, calleeStart) ||
+			(calleeStart > 0 && clean[calleeStart-1] == '.') { // obj.foo( / self.foo(
 			reply(nil) // no call context: let the popup close
 			break
 		}
